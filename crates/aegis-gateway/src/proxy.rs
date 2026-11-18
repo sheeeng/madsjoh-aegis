@@ -30,10 +30,12 @@ use tokio_rustls::TlsConnector;
 use tower_service::Service;
 
 use aegis_core::ca::Authority;
-use aegis_core::policy::Decision;
+use aegis_core::graphql::{classify, Operation, RepositoryTarget, Requirement, ScopeSpec};
+use aegis_core::policy::{is_copilot_internal, Access, Decision, GithubPolicy, Scope};
 use aegis_core::token_table::{Rule, TokenTable};
 
 use crate::copilot::{CopilotError, CopilotTokens};
+use crate::nodes::{NodeResolver, SubjectKind};
 use crate::rewrite::rewrite_header;
 
 /// The boxed error type the gateway uses across its public boundary.
@@ -97,7 +99,11 @@ impl From<Box<dyn Error + Send + Sync>> for BoxError {
     }
 }
 
-type BoxBody = http_body_util::combinators::BoxBody<Bytes, BoxError>;
+pub(crate) type BoxBody = http_body_util::combinators::BoxBody<Bytes, BoxError>;
+
+pub(crate) const USER_AGENT: &str = "aegis/0.1.0";
+pub(crate) const MAX_JSON_BODY: usize = 64 * 1024;
+const MAX_GRAPHQL_BODY: usize = 1024 * 1024;
 
 /// Serve the forward proxy on `addr` until the process exits, trusting only
 /// the platform root store for upstream connections.
@@ -177,9 +183,14 @@ pub async fn serve_with_extra_ca(
     }
 }
 
+const ENOMEM: i32 = 12;
+const ENFILE: i32 = 23;
+const EMFILE: i32 = 24;
+const ENOBUFS: i32 = 105;
+
 fn is_resource_exhaustion(err: &std::io::Error) -> bool {
     matches!(err.kind(), std::io::ErrorKind::OutOfMemory)
-        || matches!(err.raw_os_error(), Some(12 | 23 | 24 | 105))
+        || matches!(err.raw_os_error(), Some(ENOMEM | ENFILE | EMFILE | ENOBUFS))
 }
 
 /// Handle one client connection: the proxy control channel over plain HTTP.
@@ -238,15 +249,10 @@ async fn handle_connect(
 
     let lowercase_host = host.to_ascii_lowercase();
 
-    let matched = table.matching_rule(&lowercase_host).cloned().or_else(|| {
-        crate::copilot::is_copilot_host(&lowercase_host).then(|| Rule {
-            hosts: vec![lowercase_host.clone()],
-            auth_header: "authorization".to_string(),
-            placeholder: crate::copilot::PLACEHOLDER.to_string(),
-            secret: String::new(),
-            policy: None,
-        })
-    });
+    let matched = table
+        .matching_rule(&lowercase_host)
+        .cloned()
+        .or_else(|| crate::copilot::is_copilot_host(&lowercase_host).then(|| copilot_rule(&lowercase_host)));
     if let Some(rule) = matched {
         let on_upgrade = hyper::upgrade::on(&mut req);
         tokio::spawn(async move {
@@ -322,7 +328,7 @@ async fn mitm(
 
 /// Handle one decrypted request from the client, rewriting and enforcing policy.
 async fn handle_inner_request(
-    mut req: Request<BoxBody>,
+    req: Request<BoxBody>,
     rule: Rule,
     target: String,
     clients: UpstreamClients,
@@ -330,76 +336,148 @@ async fn handle_inner_request(
     let host = authority_host(&target)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let path = req.uri().path();
     if (host == "api.github.com" || host.ends_with(".github.com"))
-        && (path == "/copilot_internal" || path.starts_with("/copilot_internal/"))
+        && is_copilot_internal(req.uri().path())
     {
         return Ok(forbidden());
     }
-    if crate::copilot::is_copilot_host(&host) {
-        let authorization = req
-            .headers()
-            .get("authorization")
-            .and_then(|value| value.to_str().ok());
-        let placeholder = authorization.is_some_and(|value| {
-            rewrite_header(value, crate::copilot::PLACEHOLDER, "validated").is_some()
-        });
-        if placeholder {
-            let Some(tokens) = &clients.copilot else {
-                return Ok(forbidden());
-            };
-            let session = match tokens.session().await {
-                Ok(session) => session,
-                Err(error) => {
-                    tracing::warn!("Copilot authentication failed: {error}");
-                    return Ok(Response::builder()
-                        .status(StatusCode::BAD_GATEWAY)
-                        .body(full_body(
-                            "Copilot authentication failed. Check the host gateway log.",
-                        ))
-                        .expect("valid response"));
-                }
-            };
-            set_header(
-                &mut req,
-                "authorization",
-                format!("Bearer {}", session.token),
-            )?;
-            if req
-                .headers()
-                .get("x-api-key")
-                .is_some_and(|value| value == crate::copilot::PLACEHOLDER)
-            {
-                req.headers_mut().remove("x-api-key");
-            }
-            let endpoint: Uri = session.endpoint.parse().map_err(BoxError::from_error)?;
-            let target = endpoint
-                .authority()
-                .expect("validated endpoint")
-                .as_str()
-                .to_string();
-            set_header(&mut req, "host", target.clone())?;
-            return forward_over_tls(req, target, clients).await;
-        }
-    }
+
+    let mut req = match copilot_forward(req, &host, &clients).await? {
+        CopilotForward::Continue(req) => req,
+        CopilotForward::Handled(response) => return Ok(response),
+    };
+
     let Some(rewritten) = rewrite_request_header(&req, &rule) else {
         return forward_over_tls(req, target, clients).await;
     };
 
-    if let Some(policy) = &rule.policy {
-        let path_and_query = req
-            .uri()
-            .path_and_query()
-            .map(|value| value.as_str())
-            .unwrap_or_else(|| req.uri().path());
-        if policy.evaluate(req.method().as_str(), path_and_query) == Decision::Deny {
-            tracing::warn!("policy denied {} {}", req.method(), path_and_query);
-            return Ok(forbidden());
+    if req.method() == Method::POST && rule.policy.is_some() && req.uri().path() == "/graphql" {
+        if let Some(response) = enforce_graphql_policy(&mut req, &rule, &clients, &rewritten).await?
+        {
+            return Ok(response);
         }
+        return forward_over_tls(req, target, clients).await;
+    }
+
+    if let Some(response) = enforce_rest_policy(&req, &rule) {
+        return Ok(response);
     }
 
     set_header(&mut req, &rule.auth_header, rewritten)?;
     forward_over_tls(req, target, clients).await
+}
+
+/// The outcome of routing a request through host Copilot authentication.
+enum CopilotForward {
+    /// The request is not a Copilot placeholder request; continue normally.
+    Continue(Request<BoxBody>),
+    /// The request was authenticated and forwarded, or rejected.
+    Handled(Response<BoxBody>),
+}
+
+async fn copilot_forward(
+    mut req: Request<BoxBody>,
+    host: &str,
+    clients: &UpstreamClients,
+) -> Result<CopilotForward, BoxError> {
+    if !crate::copilot::is_copilot_host(host) {
+        return Ok(CopilotForward::Continue(req));
+    }
+    let has_placeholder = req
+        .headers()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            rewrite_header(value, crate::copilot::PLACEHOLDER, "validated").is_some()
+        });
+    if !has_placeholder {
+        return Ok(CopilotForward::Continue(req));
+    }
+
+    let Some(tokens) = &clients.copilot else {
+        return Ok(CopilotForward::Handled(forbidden()));
+    };
+    let session = match tokens.session().await {
+        Ok(session) => session,
+        Err(error) => {
+            tracing::warn!("Copilot authentication failed: {error}");
+            return Ok(CopilotForward::Handled(
+                Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(full_body(
+                        "Copilot authentication failed. Check the host gateway log.",
+                    ))
+                    .expect("valid response"),
+            ));
+        }
+    };
+
+    set_header(&mut req, "authorization", format!("Bearer {}", session.token))?;
+    if req
+        .headers()
+        .get("x-api-key")
+        .is_some_and(|value| value == crate::copilot::PLACEHOLDER)
+    {
+        req.headers_mut().remove("x-api-key");
+    }
+    let endpoint: Uri = session.endpoint.parse().map_err(BoxError::from_error)?;
+    let target = endpoint
+        .authority()
+        .expect("validated endpoint")
+        .as_str()
+        .to_string();
+    set_header(&mut req, "host", target.clone())?;
+
+    let response = forward_over_tls(req, target, (*clients).clone()).await?;
+    Ok(CopilotForward::Handled(response))
+}
+
+async fn enforce_graphql_policy(
+    req: &mut Request<BoxBody>,
+    rule: &Rule,
+    clients: &UpstreamClients,
+    rewritten: &str,
+) -> Result<Option<Response<BoxBody>>, BoxError> {
+    let body = std::mem::replace(req.body_mut(), empty_body());
+    let bytes = match http_body_util::Limited::new(body, MAX_GRAPHQL_BODY)
+        .collect()
+        .await
+    {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return Ok(Some(forbidden())),
+    };
+    if let Some(policy) = &rule.policy {
+        if graphql_decision(&bytes, policy, &clients.nodes, &rule.secret).await == Decision::Deny {
+            return Ok(Some(forbidden()));
+        }
+    }
+    *req.body_mut() = Full::new(bytes).map_err(|never| match never {}).boxed();
+    set_header(req, &rule.auth_header, rewritten.to_owned())?;
+    Ok(None)
+}
+
+fn enforce_rest_policy(req: &Request<BoxBody>, rule: &Rule) -> Option<Response<BoxBody>> {
+    let policy = rule.policy.as_ref()?;
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or_else(|| req.uri().path());
+    if policy.evaluate(req.method().as_str(), path_and_query) == Decision::Deny {
+        tracing::warn!("policy denied {} {}", req.method(), path_and_query);
+        return Some(forbidden());
+    }
+    None
+}
+
+fn copilot_rule(host: &str) -> Rule {
+    Rule {
+        hosts: vec![host.to_string()],
+        auth_header: "authorization".to_string(),
+        placeholder: crate::copilot::PLACEHOLDER.to_string(),
+        secret: String::new(),
+        policy: None,
+    }
 }
 
 /// Return the rewritten header value, or `None` when the header is absent or
@@ -408,6 +486,84 @@ fn rewrite_request_header(req: &Request<BoxBody>, rule: &Rule) -> Option<String>
     let value = req.headers().get(rule.auth_header.as_str())?;
     let value = value.to_str().ok()?;
     rewrite_header(value, &rule.placeholder, &rule.secret)
+}
+
+/// Evaluate the GitHub policy against a buffered GraphQL request body.
+///
+/// Parses the JSON body, classifies the operation, resolves any node ID
+/// repository references through the resolver, and evaluates each repository
+/// requirement against the policy. Any parse, classify, or resolve error
+/// yields [`Decision::Deny`] so the gateway fails closed.
+async fn graphql_decision(
+    body: &[u8],
+    policy: &GithubPolicy,
+    resolver: &NodeResolver,
+    token: &str,
+) -> Decision {
+    let value: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(_) => return Decision::Deny,
+    };
+
+    let query = match value.get("query").and_then(|value| value.as_str()) {
+        Some(query) => query,
+        None => return Decision::Deny,
+    };
+    let variables = value.get("variables");
+    let operation_name = value.get("operationName").and_then(|value| value.as_str());
+
+    let operation = match classify(query, variables, operation_name) {
+        Ok(operation) => operation,
+        Err(_) => return Decision::Deny,
+    };
+
+    match operation {
+        Operation::OutsideRepo { access } => match access {
+            Access::Read => Decision::Allow,
+            Access::Write => Decision::Deny,
+        },
+        Operation::Scoped(requirements) => {
+            for requirement in requirements {
+                let Some((owner, name, scope)) =
+                    resolve_requirement(&requirement, resolver, token).await
+                else {
+                    return Decision::Deny;
+                };
+                if policy.evaluate_requirement(&owner, &name, scope, requirement.access)
+                    == Decision::Deny
+                {
+                    return Decision::Deny;
+                }
+            }
+            Decision::Allow
+        }
+    }
+}
+
+/// Resolve a single GraphQL requirement to the repository owner, name, and
+/// scope the policy should evaluate, or `None` when the node cannot be resolved.
+async fn resolve_requirement(
+    requirement: &Requirement,
+    resolver: &NodeResolver,
+    token: &str,
+) -> Option<(String, String, Scope)> {
+    let (owner, name, subject_kind) = match &requirement.target {
+        RepositoryTarget::Named { owner, name } => (owner.clone(), name.clone(), None),
+        RepositoryTarget::NodeId { id, kind } => {
+            let resolved = resolver.resolve(id, *kind, token).await.ok()?;
+            (resolved.owner, resolved.name, resolved.subject_kind)
+        }
+    };
+
+    let scope = match requirement.scope {
+        ScopeSpec::Fixed(scope) => scope,
+        ScopeSpec::Subject => match subject_kind? {
+            SubjectKind::Issue => Scope::Issues,
+            SubjectKind::PullRequest => Scope::PullRequests,
+        },
+    };
+
+    Some((owner, name, scope))
 }
 
 /// Replace the value of `name` on `req` with `value`.
@@ -447,7 +603,7 @@ fn absolute_uri(authority: &str, uri: &Uri) -> Result<Uri, BoxError> {
 }
 
 /// The upstream HTTP client, which negotiates the protocol offered over ALPN.
-type UpstreamClient = hyper_util::client::legacy::Client<UpstreamConnector, BoxBody>;
+pub(crate) type UpstreamClient = hyper_util::client::legacy::Client<UpstreamConnector, BoxBody>;
 
 /// The upstream clients, one per supported protocol version, so the upstream
 /// connection matches the request version.
@@ -456,13 +612,17 @@ struct UpstreamClients {
     http1: UpstreamClient,
     http2: UpstreamClient,
     copilot: Option<Arc<CopilotTokens>>,
+    nodes: Arc<NodeResolver>,
 }
 
 /// Build the HTTP/1.1 and HTTP/2 upstream clients sharing a root store.
 fn upstream_clients(roots: Arc<rustls::RootCertStore>) -> UpstreamClients {
+    let http1 = upstream_client(Arc::clone(&roots), &[b"http/1.1"]);
+    let http2 = upstream_client(Arc::clone(&roots), &[b"h2"]);
     UpstreamClients {
-        http1: upstream_client(Arc::clone(&roots), &[b"http/1.1"]),
-        http2: upstream_client(roots, &[b"h2"]),
+        nodes: Arc::new(NodeResolver::new(http1.clone())),
+        http1,
+        http2,
         copilot: None,
     }
 }
@@ -489,7 +649,7 @@ async fn host_json_with_clients(
             .method(method)
             .uri(endpoint)
             .header("accept", "application/json")
-            .header("user-agent", "aegis/0.1.0")
+            .header("user-agent", USER_AGENT)
             .header("x-github-api-version", "2025-04-01");
         if let Some(token) = token {
             request = request.header("authorization", format!("Bearer {token}"));
@@ -515,7 +675,7 @@ async fn host_json_with_clients(
         if !response.status().is_success() {
             return Err(CopilotError::Status(response.status().as_u16()));
         }
-        let bytes = http_body_util::Limited::new(response.into_body(), 64 * 1024)
+        let bytes = http_body_util::Limited::new(response.into_body(), MAX_JSON_BODY)
             .collect()
             .await
             .map_err(|_| CopilotError::InvalidResponse)?
@@ -536,14 +696,14 @@ fn upstream_client(roots: Arc<rustls::RootCertStore>, alpn: &[&[u8]]) -> Upstrea
 /// reports the negotiated ALPN protocol so the client speaks HTTP/2 when the
 /// upstream selects it.
 #[derive(Clone)]
-struct UpstreamConnector {
+pub(crate) struct UpstreamConnector {
     tls: Arc<TlsConnector>,
     #[cfg(test)]
-    address: Option<SocketAddr>,
+    pub(crate) address: Option<SocketAddr>,
 }
 
 impl UpstreamConnector {
-    fn new(tls: Arc<TlsConnector>) -> Self {
+    pub(crate) fn new(tls: Arc<TlsConnector>) -> Self {
         Self {
             tls,
             #[cfg(test)]
@@ -599,7 +759,7 @@ fn upstream_target(uri: &Uri) -> Result<String, std::io::Error> {
 }
 
 /// The upstream transport, which reports the negotiated protocol to the client.
-struct UpstreamIo {
+pub(crate) struct UpstreamIo {
     inner: TokioIo<tokio_rustls::client::TlsStream<TcpStream>>,
     negotiated_h2: bool,
 }
@@ -752,7 +912,7 @@ impl ResolvesServerCert for CertificateResolver {
 
 /// Build the root store for upstream connections from the platform trust store
 /// and an optional extra certificate authority used in tests.
-fn upstream_root_store(extra_ca: Option<&Authority>) -> rustls::RootCertStore {
+pub(crate) fn upstream_root_store(extra_ca: Option<&Authority>) -> rustls::RootCertStore {
     let mut roots = rustls::RootCertStore::empty();
 
     if let Some(authority) = extra_ca {
@@ -771,7 +931,7 @@ fn upstream_root_store(extra_ca: Option<&Authority>) -> rustls::RootCertStore {
 
 /// The TLS connector the gateway uses when encrypting upstream again, offering
 /// the given ALPN protocols.
-fn upstream_tls_connector(roots: Arc<rustls::RootCertStore>, alpn: &[&[u8]]) -> Arc<TlsConnector> {
+pub(crate) fn upstream_tls_connector(roots: Arc<rustls::RootCertStore>, alpn: &[&[u8]]) -> Arc<TlsConnector> {
     let provider = rustls::crypto::ring::default_provider();
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()
@@ -825,11 +985,13 @@ fn full_body(text: &'static str) -> BoxBody {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use aegis_core::policy::GithubPolicy;
+    use aegis_core::policy::{CompiledRepoRule, GithubPolicy, Scope};
+    use aegis_core::secrets::Permission;
     use aegis_core::token_table::Rule;
     use hyper::client::conn::http2 as client_http2;
     use hyper::server::conn::http2 as server_http2;
@@ -911,8 +1073,9 @@ mod tests {
         })));
         let clients = UpstreamClients {
             http1: client.clone(),
-            http2: client,
+            http2: client.clone(),
             copilot: Some(tokens),
+            nodes: Arc::new(NodeResolver::new(client)),
         };
         for path in ["/models", "/chat/completions", "/responses", "/v1/messages"] {
             let rule = Rule {
@@ -1069,7 +1232,13 @@ mod tests {
     /// Start a local HTTPS upstream whose certificate is signed by the gateway
     /// CA and whose response body echoes the request head.
     async fn start_upstream(authority: &Authority) -> SocketAddr {
-        let certified = authority.leaf_certified_key("localhost").expect("leaf");
+        start_echo_upstream(authority, "localhost").await
+    }
+
+    /// Start a local HTTPS upstream presenting a certificate for `name` whose
+    /// response body echoes the request head.
+    async fn start_echo_upstream(authority: &Authority, name: &str) -> SocketAddr {
+        let certified = authority.leaf_certified_key(name).expect("leaf");
         let config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -1537,5 +1706,320 @@ mod tests {
         assert!(!text.contains("version=HTTP/2"), "response: {text}");
         assert!(text.contains(SECRET), "response: {text}");
         assert!(!text.contains(PLACEHOLDER), "response: {text}");
+    }
+
+    const REPO_NODE_RESPONSE: &str = r#"{"data":{"node":{"nameWithOwner":"org/repo"}}}"#;
+    const DENIED_NODE_RESPONSE: &str = r#"{"data":{"node":{"nameWithOwner":"evil/repo"}}}"#;
+    const NULL_NODE_RESPONSE: &str = r#"{"data":{"node":null}}"#;
+
+    fn policy_with(pattern: &str, permissions: &[(Scope, Permission)]) -> GithubPolicy {
+        GithubPolicy::new(vec![CompiledRepoRule {
+            pattern: pattern.to_string(),
+            permissions: permissions
+                .iter()
+                .map(|(scope, permission)| (*scope, *permission))
+                .collect(),
+        }])
+    }
+
+    fn graphql_rule(policy: GithubPolicy) -> Rule {
+        Rule {
+            hosts: vec!["api.github.com".to_string()],
+            auth_header: "authorization".to_string(),
+            placeholder: PLACEHOLDER.to_string(),
+            secret: SECRET.to_string(),
+            policy: Some(policy),
+        }
+    }
+
+    fn json_body(value: &serde_json::Value) -> BoxBody {
+        let bytes = serde_json::to_vec(value).expect("serialize json");
+        Full::new(Bytes::from(bytes))
+            .map_err(|never| match never {})
+            .boxed()
+    }
+
+    fn graphql_request(body: BoxBody) -> Request<BoxBody> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/graphql")
+            .header("authorization", format!("Bearer {PLACEHOLDER}"))
+            .header("content-type", "application/json")
+            .body(body)
+            .expect("valid request")
+    }
+
+    /// Build the upstream clients for GraphQL tests: the forwarding clients
+    /// echo against `echo_addr` and the node resolver resolves against
+    /// `node_addr`.
+    fn graphql_clients(
+        authority: &Authority,
+        echo_addr: SocketAddr,
+        node_addr: SocketAddr,
+    ) -> UpstreamClients {
+        let roots = Arc::new(upstream_root_store(Some(authority)));
+
+        let mut echo_connector =
+            UpstreamConnector::new(upstream_tls_connector(Arc::clone(&roots), &[b"http/1.1"]));
+        echo_connector.address = Some(echo_addr);
+        let http1 =
+            hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build(echo_connector);
+
+        let mut echo_connector_h2 =
+            UpstreamConnector::new(upstream_tls_connector(Arc::clone(&roots), &[b"h2"]));
+        echo_connector_h2.address = Some(echo_addr);
+        let http2 =
+            hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+                .build(echo_connector_h2);
+
+        let mut node_connector =
+            UpstreamConnector::new(upstream_tls_connector(roots, &[b"http/1.1"]));
+        node_connector.address = Some(node_addr);
+        let node_client =
+            hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build(node_connector);
+
+        UpstreamClients {
+            http1,
+            http2,
+            copilot: None,
+            nodes: Arc::new(NodeResolver::new(node_client)),
+        }
+    }
+
+    /// Start a local HTTPS upstream that answers GraphQL node lookups from a
+    /// fixed response table keyed by node ID.
+    async fn start_node_upstream(
+        authority: &Authority,
+        responses: HashMap<String, String>,
+    ) -> SocketAddr {
+        let certified = authority.leaf_certified_key("api.github.com").expect("leaf");
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("supported protocol versions")
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(FixedResolver { certified }));
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let responses = Arc::new(std::sync::Mutex::new(responses));
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let acceptor = acceptor.clone();
+                let responses = Arc::clone(&responses);
+                tokio::spawn(async move {
+                    let tls = acceptor.accept(stream).await.expect("tls accept");
+                    serve_node_lookup(tls, responses).await;
+                });
+            }
+        });
+
+        addr
+    }
+
+    /// Serve one GraphQL node lookup by returning the canned response for the
+    /// node ID in the request body.
+    async fn serve_node_lookup(
+        tls: TlsStream<TcpStream>,
+        responses: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    ) {
+        let service = service_fn(move |request: Request<Incoming>| {
+            let responses = Arc::clone(&responses);
+            async move {
+                let body = request
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("request body")
+                    .to_bytes();
+                let id = serde_json::from_slice::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .pointer("/variables/id")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string)
+                    });
+                let payload = id
+                    .as_deref()
+                    .and_then(|id| responses.lock().unwrap().get(id).cloned())
+                    .unwrap_or_else(|| NULL_NODE_RESPONSE.to_string());
+                Ok::<_, hyper::Error>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .body(Full::new(Bytes::from(payload)))
+                        .expect("valid response"),
+                )
+            }
+        });
+        let _ = http1::Builder::new()
+            .serve_connection(TokioIo::new(tls), service)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn graphql_named_repository_query_allowed_under_contents_read() {
+        let dir = temp_dir("graphql-named-query");
+        let authority = Authority::load_or_create(&dir).expect("authority");
+        let echo_addr = start_echo_upstream(&authority, "api.github.com").await;
+        let node_addr = start_node_upstream(&authority, HashMap::new()).await;
+        let clients = graphql_clients(&authority, echo_addr, node_addr);
+        let policy = policy_with("org/repo", &[(Scope::Contents, Permission::Read)]);
+        let query = r#"query { repository(owner: "org", name: "repo") { object(expression: "HEAD") { oid } } }"#;
+        let request = graphql_request(json_body(&serde_json::json!({ "query": query })));
+
+        let response = handle_inner_request(
+            request,
+            graphql_rule(policy),
+            "api.github.com:443".to_string(),
+            clients,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains(SECRET), "response: {text}");
+        assert!(!text.contains(PLACEHOLDER), "response: {text}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn graphql_named_repository_mutation_denied_under_contents_read() {
+        let dir = temp_dir("graphql-named-mutation");
+        let authority = Authority::load_or_create(&dir).expect("authority");
+        let echo_addr = start_echo_upstream(&authority, "api.github.com").await;
+        let node_addr = start_node_upstream(&authority, HashMap::new()).await;
+        let clients = graphql_clients(&authority, echo_addr, node_addr);
+        let policy = policy_with("org/repo", &[(Scope::Contents, Permission::Read)]);
+        let query = r#"mutation { createCommitOnBranch(input: { branch: { repositoryNameWithOwner: "org/repo", branchName: "main" }, message: { headline: "x" }, fileChanges: { additions: [] } }) { commit { oid } } }"#;
+        let request = graphql_request(json_body(&serde_json::json!({ "query": query })));
+
+        let response = handle_inner_request(
+            request,
+            graphql_rule(policy),
+            "api.github.com:443".to_string(),
+            clients,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn graphql_repository_id_resolving_to_allowed_repo_is_forwarded() {
+        let dir = temp_dir("graphql-node-allowed");
+        let authority = Authority::load_or_create(&dir).expect("authority");
+        let echo_addr = start_echo_upstream(&authority, "api.github.com").await;
+        let node_addr = start_node_upstream(
+            &authority,
+            HashMap::from([("repo-id".to_string(), REPO_NODE_RESPONSE.to_string())]),
+        )
+        .await;
+        let clients = graphql_clients(&authority, echo_addr, node_addr);
+        let policy = policy_with("org/repo", &[(Scope::Issues, Permission::Write)]);
+        let query = r#"mutation { createIssue(input: { repositoryId: "repo-id", title: "t" }) { issue { id } } }"#;
+        let request = graphql_request(json_body(&serde_json::json!({ "query": query })));
+
+        let response = handle_inner_request(
+            request,
+            graphql_rule(policy),
+            "api.github.com:443".to_string(),
+            clients,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains(SECRET), "response: {text}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn graphql_repository_id_resolving_to_denied_repo_is_forbidden() {
+        let dir = temp_dir("graphql-node-denied");
+        let authority = Authority::load_or_create(&dir).expect("authority");
+        let echo_addr = start_echo_upstream(&authority, "api.github.com").await;
+        let node_addr = start_node_upstream(
+            &authority,
+            HashMap::from([("other-id".to_string(), DENIED_NODE_RESPONSE.to_string())]),
+        )
+        .await;
+        let clients = graphql_clients(&authority, echo_addr, node_addr);
+        let policy = policy_with("org/repo", &[(Scope::Issues, Permission::Write)]);
+        let query = r#"mutation { createIssue(input: { repositoryId: "other-id", title: "t" }) { issue { id } } }"#;
+        let request = graphql_request(json_body(&serde_json::json!({ "query": query })));
+
+        let response = handle_inner_request(
+            request,
+            graphql_rule(policy),
+            "api.github.com:443".to_string(),
+            clients,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn graphql_body_without_query_field_is_forbidden() {
+        let dir = temp_dir("graphql-no-query");
+        let authority = Authority::load_or_create(&dir).expect("authority");
+        let echo_addr = start_echo_upstream(&authority, "api.github.com").await;
+        let node_addr = start_node_upstream(&authority, HashMap::new()).await;
+        let clients = graphql_clients(&authority, echo_addr, node_addr);
+        let policy = policy_with("org/repo", &[(Scope::Contents, Permission::Read)]);
+        let request = graphql_request(json_body(&serde_json::json!({ "variables": {} })));
+
+        let response = handle_inner_request(
+            request,
+            graphql_rule(policy),
+            "api.github.com:443".to_string(),
+            clients,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn graphql_body_larger_than_one_mebibyte_is_forbidden() {
+        let dir = temp_dir("graphql-oversized");
+        let authority = Authority::load_or_create(&dir).expect("authority");
+        let echo_addr = start_echo_upstream(&authority, "api.github.com").await;
+        let node_addr = start_node_upstream(&authority, HashMap::new()).await;
+        let clients = graphql_clients(&authority, echo_addr, node_addr);
+        let policy = policy_with("org/repo", &[(Scope::Contents, Permission::Read)]);
+        let oversized = vec![b'a'; 1024 * 1024 + 1];
+        let body = Full::new(Bytes::from(oversized))
+            .map_err(|never| match never {})
+            .boxed();
+        let request = graphql_request(body);
+
+        let response = handle_inner_request(
+            request,
+            graphql_rule(policy),
+            "api.github.com:443".to_string(),
+            clients,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
